@@ -1,6 +1,4 @@
-(* Draft Kings *)
-
-(* TODO: *)
+(* Pull NFL historical data available *)
 
 #require "lwt.syntax";;
 #require "lwt";;
@@ -13,7 +11,14 @@
 
 type status = Active | InActive | StatusError of string
 
-type game_type = PreSeason | RegularSeason | PostSeason | Error of string
+type game_type = PreSeason | RegularSeason | PostSeason | GameTypeError of string
+
+let game_type_of_string s =
+  match String.uppercase s with
+  | "PRESEASON" -> PreSeason
+  | "REGULAR SEASON" -> RegularSeason
+  | "POSTSEASON" -> PostSeason
+  | _ -> GameTypeError s
 
 type position = QB | RB | WR | TE | DST | Unknown of string
 
@@ -125,7 +130,7 @@ type player_stat = {
   fumbles_lost   : int
 }
 
-type data_row = Headers of string list | GameData of player_stat
+type data_row = Headers of string list | GameData of player_stat | DataRowError of string
 
 let position_of_string s =
   match String.uppercase s with
@@ -141,6 +146,14 @@ let status_of_string s =
   | "active"   -> Active
   | "inactive" -> InActive
   | _ as s -> StatusError s
+
+let rec filter_map ?(accum = []) ~filter_f ~map_f l =
+  match l with
+  | [] -> List.rev accum
+  | hd :: tl ->
+    if filter_f hd
+    then filter_map ~accum:((map_f hd) :: accum) ~filter_f ~map_f tl
+    else filter_map ~accum ~filter_f ~map_f tl
 
 module NFL = struct
 
@@ -354,25 +367,77 @@ module NFL = struct
   let games_table html =
     html_drop_left ~tag:"<table class='data-table1'" html
 
+let get_game_type html =
+  markup_of_html html
+  |> fun l ->
+  let g =
+    try
+      List.nth l 2
+    with
+      Failure "nth" -> raise (Failure "ERROR: get_game_type - List.nth")
+  in
+  match g with
+  | `Text [t] -> game_type_of_string t
+  | _ -> raise (Failure "ERROR: get_game_type - received unexpected html!")
+
+  let clean_html html =
+    Str.global_replace (Str.regexp "[\r\t\n\ ]+") " " html
+
+  (* Split html into sections containing season games, i.e. Pre Season, Regular Season, etc... *)
+  let split_season ?(keep_delims = false) ?(combine_delims = false) ~tag html =
+    let delim_list = clean_html html |> Str.full_split (Str.regexp tag) in
+    (* Remove all data to the left of the first Str.Delim *)
+    let delim_list2 =
+      match delim_list with
+      | [] -> []
+      | Str.Delim _ :: tl -> delim_list
+      | _ :: tl -> tl
+    in
+    (* Remove the last element if it is a delim *)
+    let delim_list3 =
+      match List.rev delim_list2 with
+      | [] -> []
+      | Str.Delim _ :: tl -> List.rev tl
+      | _ :: tl -> delim_list2
+    in
+    let rec clean_list ?(accum = []) l =
+      match l with
+      | [] -> List.rev accum
+      | Str.Delim d :: tl ->
+        if keep_delims
+        then clean_list ~accum:(d :: accum) tl
+        else clean_list ~accum tl
+      | Str.Text t :: tl -> clean_list ~accum:(clean_html t :: accum) tl
+    in
+    (* Re-concatenate the delimiters and the text data *)
+    let rec concat_html ?(acc = []) ?(delim = "") sl =
+      match sl, delim with
+      | [], _ -> List.rev acc
+      | hd :: tl, "" -> concat_html ~acc ~delim:hd tl
+      | hd :: tl, _ -> concat_html ~acc:((delim ^ hd) :: acc) tl
+    in
+    if combine_delims
+    then concat_html @@ clean_list delim_list3
+    else clean_list delim_list3
+
   (* Get the headers from a games table *)
   let get_headers games_table_html =
-    html_drop_left ~tag:"<tr class=\"player-table-key\">" games_table_html
-    |> markup_of_html
-    |> truncate_dom_list
-    |> List.filter (
-      fun x ->
+    let filter_f x =
         match x with
         | `Text [" "] -> false
         | `Text _ -> true
         | _ -> false
-    )
-    |> List.map (
-      fun x ->
-        match x with
-        | `Text [s] -> s
-        | _ -> raise (Failure "ERROR: Unexpected Polymorphic Variance in get_headers.")
-    )
-  |> fun sl -> Headers sl
+    in
+    let map_f x =
+      match x with
+      | `Text [s] -> s
+      | _ -> raise (Failure "ERROR: Unexpected Polymorphic Variance in get_headers.")
+    in
+    html_drop_left ~tag:"<tr class=\"player-table-key\">" games_table_html
+    |> markup_of_html
+    |> truncate_dom_list
+    |> filter_map ~filter_f ~map_f
+    |> fun sl -> Headers sl
 
   let rec split_game_list ?(games = []) ?(game = []) gl =
     match gl, game with
@@ -392,7 +457,9 @@ module NFL = struct
       ) (Array.of_list game)
     in
     (* Fix the Date into YYYY-MM-DD format *)
-    let [month; day] = Str.split (Str.regexp "/") arr.(1) in
+    let [month; day] =
+        if arr.(1) = "Bye" then ["0"; "0"] else Str.split (Str.regexp "/") arr.(1)
+    in
     arr.(1) <- ((string_of_int year) ^ "-" ^ month ^ "-" ^ day);
     (* Fixup the opponet *)
     arr.(2) <- Str.global_replace (Str.regexp "[ @]+") "" arr.(2);
@@ -402,34 +469,34 @@ module NFL = struct
     Array.to_list @@
     Array.concat [Array.sub arr_cln 0 3; Array.sub arr_cln 5 (Array.length arr_cln - 5)]
 
-let player_stat_of_string_list sl = {
-  game_type      = Error "Need to label game_type";
-  week           = int_of_string @@ List.nth sl 0;
-  game_date      = game_date_of_string @@ List.nth sl 1;
-  opponet        = team_name_of_string @@ List.nth sl 2;
-  game_result    = game_result_of_string @@ List.nth sl 3;
-  played_in_game = if List.nth sl 4 = "1" then true else false;
-  starter        = if List.nth sl 5 = "1" then true else false;
-  passing_comp   = int_of_string @@ List.nth sl 6;
-  passing_att    = int_of_string @@ List.nth sl 7;
-  passing_pct    = float_of_string @@ List.nth sl 8;
-  passing_yds    = float_of_string @@ List.nth sl 9;
-  passing_avg    = float_of_string @@ List.nth sl 10;
-  passing_td     = float_of_string @@ List.nth sl 11;
-  passing_int    = float_of_string @@ List.nth sl 12;
-  passing_sck    = float_of_string @@ List.nth sl 13;
-  passing_scky   = float_of_string @@ List.nth sl 14;
-  passing_rate   = float_of_string @@ List.nth sl 15;
-  rushing_att    = int_of_string @@ List.nth sl 16;
-  rushing_yds    = float_of_string @@ List.nth sl 17;
-  rushing_avg    = float_of_string @@ List.nth sl 18;
-  rushing_td     = int_of_string @@ List.nth sl 19;
-  fumbles        = int_of_string @@ List.nth sl 20;
-  fumbles_lost   = int_of_string @@ List.nth sl 21
-}
+  let player_stat_of_string_list ~game_type sl = {
+    game_type      = game_type;
+    week           = int_of_string @@ List.nth sl 0;
+    game_date      = game_date_of_string @@ List.nth sl 1;
+    opponet        = team_name_of_string @@ List.nth sl 2;
+    game_result    = game_result_of_string @@ List.nth sl 3;
+    played_in_game = if List.nth sl 4 = "1" then true else false;
+    starter        = if List.nth sl 5 = "1" then true else false;
+    passing_comp   = int_of_string @@ List.nth sl 6;
+    passing_att    = int_of_string @@ List.nth sl 7;
+    passing_pct    = float_of_string @@ List.nth sl 8;
+    passing_yds    = float_of_string @@ List.nth sl 9;
+    passing_avg    = float_of_string @@ List.nth sl 10;
+    passing_td     = float_of_string @@ List.nth sl 11;
+    passing_int    = float_of_string @@ List.nth sl 12;
+    passing_sck    = float_of_string @@ List.nth sl 13;
+    passing_scky   = float_of_string @@ List.nth sl 14;
+    passing_rate   = float_of_string @@ List.nth sl 15;
+    rushing_att    = int_of_string @@ List.nth sl 16;
+    rushing_yds    = float_of_string @@ List.nth sl 17;
+    rushing_avg    = float_of_string @@ List.nth sl 18;
+    rushing_td     = int_of_string @@ List.nth sl 19;
+    fumbles        = int_of_string @@ List.nth sl 20;
+    fumbles_lost   = int_of_string @@ List.nth sl 21
+  }
 
   (* Get the data from a games table *)
-  let get_games_data ~year games_table_html =
+  let get_games_data ~year ~game_type games_table_html =
     html_drop_left ~tag:"<tbody>" games_table_html
     |> markup_of_html
     |> truncate_dom_list
@@ -444,8 +511,16 @@ let player_stat_of_string_list sl = {
     )
     |> split_game_list
     |> List.map (clean_game_data ~year)
-    |> List.map (fun sl -> GameData (player_stat_of_string_list sl))
+    |> fun sll ->
+      List.map (
+        fun sl ->
+            try
+              GameData (player_stat_of_string_list ~game_type sl)
+            with
+              _ -> DataRowError (String.concat "," sl)
+          ) sll
 
+  (* TODO: Handle Bye games and "Total" rows better *)
   (* Pull player stats for a specific season *)
   let stats_in_season ~year player =
     (* Get html with non-space whitespace removed *)
@@ -455,13 +530,19 @@ let player_stat_of_string_list sl = {
       "/gamelogs?season=" ^ (string_of_int year)
     in
     lwt html = get_html url in
-    let g_tbl = games_table html in
-    Lwt.return (get_headers g_tbl :: get_games_data ~year g_tbl)
-
-    (* TODO: Get the preseason table, the parse into a string list list *)
-    (* Then expand to get the regular, postseason, etc... tables *)
-    (* TODO: Need to mark games as pre,post,regular season, etc... *)
-    (* TODO: Parse into a data_row *)
+    let game_types =
+      split_season ~tag:"<tr class=\"NOcolors player-table-header\">" html
+      |> List.map get_game_type
+    in
+    let g_tbl =
+      split_season ~keep_delims:true ~combine_delims:true ~tag:"<table class='data-table1'" html
+      |> List.map games_table
+    in
+    let headers = get_headers @@ List.hd g_tbl in
+    let data_rows =
+      List.map2 (fun gt sl -> get_games_data ~year ~game_type:gt sl) game_types g_tbl
+    in
+    Lwt.return (headers :: List.flatten data_rows)
 
   let test () =
     let drew_brees = {
@@ -477,7 +558,7 @@ let player_stat_of_string_list sl = {
       id = 2504775
     }
     in
-    player_html ~player:drew_brees ~season:2015 ()
-    >>= fun y -> stats_in_season ~year:2015 drew_brees
+    player_html ~player:drew_brees ~season:2009 ()
+    >>= fun y -> stats_in_season ~year:2009 drew_brees
 
 end
