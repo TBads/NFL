@@ -72,10 +72,12 @@ type team = {
   conference : string
 }
 
+type game_date = {year : int; month : int; day : int}
+
 (* Player stats for a single game *)
 type player_stats = {
   game_type      : game_type;
-  date_date      : Unix.tm;
+  date_date      : game_date;
   opponet        : team_name;
   game_result    : game_result;
   played_in_game : bool;
@@ -307,83 +309,87 @@ module NFL = struct
           else truncate_dom_list ~accum:(hd :: accum) tl
         | _ -> truncate_dom_list ~accum:(hd :: accum) tl
 
-  (* Find the first dom element which has a specific tag and payload *)
-  let rec find_dom_start_element ~tag ~dom_list (l : Markup.signal list) =
-    match l with
-    | [] -> []
-    | hd :: tl -> (
-        match hd with
-        | `Start_element ((_, tag_str), dl) ->
-          if (tag_str = tag) && (dl = dom_list)
-          then l
-          else find_dom_start_element ~tag ~dom_list tl
-        | _ -> find_dom_start_element ~tag ~dom_list tl
-      )
-
-  (* TEST THIS *)
-  let rec seek_exact_start_element
-    ?(dom_lists_to_check = [])
-    ~tag
-    ~target_dom_list
-    (l : Markup.signal list) =
-    match l with
-    | [] ->
-      begin
-        match dom_lists_to_check with
-        | [] -> []
-        | hd :: [] ->
-          begin
-            match hd with
-            | `Start_element ((_, tag_str), dl) ->
-                if (tag_str = tag) && (dl = target_dom_list) then [hd] else []
-            | _ -> []
-          end
-        | hd :: tl -> seek_exact_start_element ~dom_lists_to_check:[hd] ~tag ~target_dom_list tl
-      end
-    | hd :: tl ->
-      seek_exact_start_element
-        ~dom_lists_to_check:(hd :: dom_lists_to_check)
-        ~tag
-        ~target_dom_list
-        tl
-
-  let rec seek_exact_start_element_2
-    ?(dom_lists_to_check = [])
-    ~tag
-    ~target_dom_list
-    (l : Markup.signal list) =
-    match l with
-    | [] -> List.rev dom_lists_to_check
-    | hd :: tl ->
-      seek_exact_start_element_2
-        ~dom_lists_to_check:(hd :: dom_lists_to_check)
-        ~tag
-        ~target_dom_list
-        tl
-
-  (*
-      Maybe the easiest way to find the table is to
-      (1) search for the table tag regex
-      (2) then parse as markup
-  *)
-
   let markup_of_html html =
     let open Markup in
     string html |> parse_html |> signals |> to_list
 
+  (* Eliminate everyting to the left of the tag *)
+  let html_drop_left ~tag html =
+    let clean_html = Str.global_replace (Str.regexp "[\r\t\n\ ]+") " " html in
+    let start_loc = Str.search_forward (Str.regexp tag) clean_html 0 in
+    String.sub clean_html start_loc ((String.length clean_html) - start_loc)
+
   (* Select a specific section of html inbetween tags ~start_tag and ~end_tag, including tags *)
   let html_substring ~tag html =
-    let clean_html = Str.global_replace (Str.regexp "[\r\t\n\ ]+") " " html in
-    (* Remove everything to the left of the target html token *)
-    let start_loc = Str.search_forward (Str.regexp tag) clean_html 0 in
-    let str_and_extra =
-      String.sub clean_html start_loc ((String.length clean_html) - start_loc)
-    in
-    (* Convert to a Markup.signal list, then parse the right side of the string away *)
-    truncate_dom_list @@ markup_of_html str_and_extra
+    html_drop_left ~tag html |> markup_of_html |> truncate_dom_list
 
-  (* TODO: Pull player stats for a specific season *)
-  let stats_in_season player year =
+ (* Get the first games table that appears in an html string *)
+  let games_table html =
+    html_drop_left ~tag:"<table class='data-table1'" html
+
+  (* Get the headers from a games table *)
+  let get_headers games_table_html =
+    html_drop_left ~tag:"<tr class=\"player-table-key\">" games_table_html
+    |> markup_of_html
+    |> truncate_dom_list
+    |> List.filter (
+      fun x ->
+        match x with
+        | `Text [" "] -> false
+        | `Text _ -> true
+        | _ -> false
+    )
+    |> List.map (
+      fun x ->
+        match x with
+        | `Text [s] -> s
+        | _ -> raise (Failure "ERROR: Unexpected Polymorphic Variance in get_headers.")
+    )
+
+  let split_game_list ?(games = []) ?(game = []) gl =
+    match gl, game with
+    | [], _ -> List.rev games
+    | `Text [s] :: tl, _ -> split_game_list ~games ~game:(s :: game) tl
+    | _ :: tl, [] -> split_game_list ~games ~game:[] tl
+    | _ :: tl, _ -> split_game_list ~games:((List.rev game) :: games) ~game:[] tl
+
+let clean_game_data ~year game =
+  (* Replace "--" with "N/A" *)
+  let arr =
+    Array.map (
+      fun s ->
+        match s with
+        | "--" -> "N/A"
+        | _ -> s
+    ) (Array.of_list game)
+  in
+  (* Fix the Date into YYYY-MM-DD format *)
+  let [month; day] = Str.split (Str.regexp "/") arr.(1) in
+  arr.(1) <- ((string_of_int year) ^ "-" ^ month ^ "-" ^ day);
+  (* Fixup the opponet *)
+  arr.(2) <- Str.global_replace (Str.regexp "[ @]+") "" arr.(2);
+  (* Drop items 4 and drop the W/L, this can be obtained from the score *)
+  Array.to_list @@ Array.concat [Array.sub arr 0 3; Array.sub arr 5 (Array.length arr - 5)]
+
+  (* Get the data from a games table *)
+  let get_games_data ~year games_table_html =
+    html_drop_left ~tag:"<tbody>" games_table_html
+    |> markup_of_html
+    |> truncate_dom_list
+    (* Only keep <tr> tags to separate the list into games and the `Text data *)
+    |> List.filter (
+      fun x ->
+        match x with
+        | `Start_element ((_, "tr"), _) -> true
+        | `Text [" "] -> false
+        | `Text _ -> true
+        | _ -> false
+    )
+    |> split_game_list
+    |> List.map (clean_game_data ~year)
+
+  (* Pull player stats for a specific season *)
+  let stats_in_season ~year player =
     (* Get html with non-space whitespace removed *)
     let url =
       "http://www.nfl.com/player/" ^
@@ -391,10 +397,12 @@ module NFL = struct
       "/gamelogs?season=" ^ (string_of_int year)
     in
     lwt html = get_html url in
-    (* Get the section of html containing all tables *)
-    Lwt.return @@ html_substring ~tag:"<table class='data-table1'" html
+    let g_tbl = games_table html in
+    Lwt.return (get_headers g_tbl :: get_games_data ~year g_tbl)
+
     (* TODO: Get the preseason table, the parse into a string list list *)
     (* Then expand to get the regular, postseason, etc... tables *)
+    (* TODO: Need to mark games as pre,post,regular season, etc... *)
 
   let test () =
     let drew_brees = {
@@ -411,8 +419,6 @@ module NFL = struct
     }
     in
     player_html ~player:drew_brees ~season:2015 ()
-    >>= get_player_seasons
-    >|= List.hd
-    >>= (stats_in_season drew_brees)
+    >>= fun y -> stats_in_season ~year:2015 drew_brees
 
 end
