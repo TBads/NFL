@@ -1,5 +1,7 @@
 (* Draft Kings *)
 
+(* TODO: *)
+
 #require "lwt.syntax";;
 #require "lwt";;
 #require "cohttp.lwt";;
@@ -11,12 +13,25 @@
 
 type status = Active | InActive | StatusError of string
 
-type game_type = PreSeason | RegularSeason | PostSeason
+type game_type = PreSeason | RegularSeason | PostSeason | Error of string
 
 type position = QB | RB | WR | TE | DST | Unknown of string
 
 type game_result = Win of int * int
                  | Loss of int * int
+                 | Tie of int * int
+
+let game_result_of_string s =
+  let [a; b] = Str.split (Str.regexp "-") s in
+  let s1 = int_of_string a in
+  let s2 = int_of_string b in
+  if s1 > s2
+  then Win (s1, s2)
+  else (
+    if s1 < s2
+    then Loss (s1, s2)
+    else Tie (s1, s2)
+  )
 
 type team_name = Ravens
                 | Bengals
@@ -74,10 +89,20 @@ type team = {
 
 type game_date = {year : int; month : int; day : int}
 
+
+let game_date_of_string s =
+  let [year; month; day] = Str.split (Str.regexp "-") s in
+  {
+    year = int_of_string year;
+    month = int_of_string month;
+    day = int_of_string day
+  }
+
 (* Player stats for a single game *)
-type player_stats = {
+type player_stat = {
   game_type      : game_type;
-  date_date      : game_date;
+  week           : int;
+  game_date      : game_date;
   opponet        : team_name;
   game_result    : game_result;
   played_in_game : bool;
@@ -99,6 +124,8 @@ type player_stats = {
   fumbles        : int;
   fumbles_lost   : int
 }
+
+type data_row = Headers of string list | GameData of player_stat
 
 let position_of_string s =
   match String.uppercase s with
@@ -130,39 +157,39 @@ module NFL = struct
 
   let team_name_of_string s =
     match s with
-    | "Baltimore Ravens"     -> Ravens
-    | "Cincinati Bengals"    -> Bengals
-    | "Cleveland Browns"     -> Browns
-    | "Pittsburgh Steelers"  -> Steelers
-    | "Houston Texans"       -> Texans
-    | "Indianapolis Colts"   -> Colts
-    | "Jacksonville Jaguars" -> Jaguars
-    | "Tennessee Titans"     -> Titans
-    | "Buffalo Bills"        -> Bills
-    | "Miami Dolphins"       -> Dolphins
-    | "New England Patriots" -> Patriots
-    | "New York Jets"        -> Jets
-    | "Denver Broncos"       -> Broncos
-    | "Kansas City Chiefs"   -> Chiefs
-    | "Okland Raiders"       -> Raiders
-    | "San Diego Chargers"   -> Chargers
-    | "Chicago Bears"        -> Bears
-    | "Detroit Lions"        -> Lions
-    | "Green Bay Packers"    -> Packers
-    | "Minnesota Vikings"    -> Vikings
-    | "Atlanta Falcons"      -> Falcons
-    | "Carolina Panthers"    -> Panthers
-    | "New Orleans Saints"   -> Saints
-    | "Tampa Bay Buccaneers" -> Buccaneers
-    | "Dallas Cowboys"       -> Cowboys
-    | "New York Giants"      -> Giants
-    | "Philadelphia Eagles"  -> Eagles
-    | "Washington Redskins"  -> Redskins
-    | "Arizona Cardinals"    -> Cardinals
-    | "Los Angeles Rams"     -> Rams
-    | "San Francisco 49ers"  -> SF49ers
-    | "Seattle Seahawks"     -> Seahawks
-    | _                      -> TeamNameError s
+    | "Baltimore Ravens"     | "BAL" -> Ravens
+    | "Cincinati Bengals"    | "CIN" -> Bengals
+    | "Cleveland Browns"     | "CLE" -> Browns
+    | "Pittsburgh Steelers"  | "PIT" -> Steelers
+    | "Houston Texans"       | "HOU" -> Texans
+    | "Indianapolis Colts"   | "IND" -> Colts
+    | "Jacksonville Jaguars" | "JAC" -> Jaguars
+    | "Tennessee Titans"     | "TEN" -> Titans
+    | "Buffalo Bills"        | "BUF" -> Bills
+    | "Miami Dolphins"       | "MIA" -> Dolphins
+    | "New England Patriots" | "NE"  -> Patriots
+    | "New York Jets"        | "NYJ" -> Jets
+    | "Denver Broncos"       | "DEN" -> Broncos
+    | "Kansas City Chiefs"   | "KC"  -> Chiefs
+    | "Okland Raiders"       | "OAK" -> Raiders
+    | "San Diego Chargers"   | "SAN" -> Chargers
+    | "Chicago Bears"        | "CHI" -> Bears
+    | "Detroit Lions"        | "DET" -> Lions
+    | "Green Bay Packers"    | "GB"  -> Packers
+    | "Minnesota Vikings"    | "MIN" -> Vikings
+    | "Atlanta Falcons"      | "ATL" -> Falcons
+    | "Carolina Panthers"    | "CAR" -> Panthers
+    | "New Orleans Saints"   | "NO"  -> Saints
+    | "Tampa Bay Buccaneers" | "TB"  -> Buccaneers
+    | "Dallas Cowboys"       | "DAL" -> Cowboys
+    | "New York Giants"      | "NYG" -> Giants
+    | "Philadelphia Eagles"  | "PHI" -> Eagles
+    | "Washington Redskins"  | "WAS" -> Redskins
+    | "Arizona Cardinals"    | "ARI" -> Cardinals
+    | "Los Angeles Rams"     | "STL" -> Rams
+    | "San Francisco 49ers"  | "SF"  -> SF49ers
+    | "Seattle Seahawks"     | "SEA" -> Seahawks
+    | _                              -> TeamNameError s
 
   type roster = {
     player_1 : player;
@@ -345,31 +372,61 @@ module NFL = struct
         | `Text [s] -> s
         | _ -> raise (Failure "ERROR: Unexpected Polymorphic Variance in get_headers.")
     )
+  |> fun sl -> Headers sl
 
-  let split_game_list ?(games = []) ?(game = []) gl =
+  let rec split_game_list ?(games = []) ?(game = []) gl =
     match gl, game with
     | [], _ -> List.rev games
     | `Text [s] :: tl, _ -> split_game_list ~games ~game:(s :: game) tl
     | _ :: tl, [] -> split_game_list ~games ~game:[] tl
     | _ :: tl, _ -> split_game_list ~games:((List.rev game) :: games) ~game:[] tl
 
-let clean_game_data ~year game =
-  (* Replace "--" with "N/A" *)
-  let arr =
-    Array.map (
-      fun s ->
-        match s with
-        | "--" -> "N/A"
-        | _ -> s
-    ) (Array.of_list game)
-  in
-  (* Fix the Date into YYYY-MM-DD format *)
-  let [month; day] = Str.split (Str.regexp "/") arr.(1) in
-  arr.(1) <- ((string_of_int year) ^ "-" ^ month ^ "-" ^ day);
-  (* Fixup the opponet *)
-  arr.(2) <- Str.global_replace (Str.regexp "[ @]+") "" arr.(2);
-  (* Drop items 4 and drop the W/L, this can be obtained from the score *)
-  Array.to_list @@ Array.concat [Array.sub arr 0 3; Array.sub arr 5 (Array.length arr - 5)]
+  let clean_game_data ~year game =
+    (* Replace "--" with "0" *)
+    let arr =
+      Array.map (
+        fun s ->
+          match s with
+          | "--" -> "0"
+          | _ -> s
+      ) (Array.of_list game)
+    in
+    (* Fix the Date into YYYY-MM-DD format *)
+    let [month; day] = Str.split (Str.regexp "/") arr.(1) in
+    arr.(1) <- ((string_of_int year) ^ "-" ^ month ^ "-" ^ day);
+    (* Fixup the opponet *)
+    arr.(2) <- Str.global_replace (Str.regexp "[ @]+") "" arr.(2);
+    (* Remove spaces from the score *)
+    let arr_cln = Array.map (fun s -> Str.global_replace (Str.regexp "[ ]+") "" s) arr in
+    (* Drop items 4 and drop the W/L, this can be obtained from the score *)
+    Array.to_list @@
+    Array.concat [Array.sub arr_cln 0 3; Array.sub arr_cln 5 (Array.length arr_cln - 5)]
+
+let player_stat_of_string_list sl = {
+  game_type      = Error "Need to label game_type";
+  week           = int_of_string @@ List.nth sl 0;
+  game_date      = game_date_of_string @@ List.nth sl 1;
+  opponet        = team_name_of_string @@ List.nth sl 2;
+  game_result    = game_result_of_string @@ List.nth sl 3;
+  played_in_game = if List.nth sl 4 = "1" then true else false;
+  starter        = if List.nth sl 5 = "1" then true else false;
+  passing_comp   = int_of_string @@ List.nth sl 6;
+  passing_att    = int_of_string @@ List.nth sl 7;
+  passing_pct    = float_of_string @@ List.nth sl 8;
+  passing_yds    = float_of_string @@ List.nth sl 9;
+  passing_avg    = float_of_string @@ List.nth sl 10;
+  passing_td     = float_of_string @@ List.nth sl 11;
+  passing_int    = float_of_string @@ List.nth sl 12;
+  passing_sck    = float_of_string @@ List.nth sl 13;
+  passing_scky   = float_of_string @@ List.nth sl 14;
+  passing_rate   = float_of_string @@ List.nth sl 15;
+  rushing_att    = int_of_string @@ List.nth sl 16;
+  rushing_yds    = float_of_string @@ List.nth sl 17;
+  rushing_avg    = float_of_string @@ List.nth sl 18;
+  rushing_td     = int_of_string @@ List.nth sl 19;
+  fumbles        = int_of_string @@ List.nth sl 20;
+  fumbles_lost   = int_of_string @@ List.nth sl 21
+}
 
   (* Get the data from a games table *)
   let get_games_data ~year games_table_html =
@@ -387,6 +444,7 @@ let clean_game_data ~year game =
     )
     |> split_game_list
     |> List.map (clean_game_data ~year)
+    |> List.map (fun sl -> GameData (player_stat_of_string_list sl))
 
   (* Pull player stats for a specific season *)
   let stats_in_season ~year player =
@@ -403,6 +461,7 @@ let clean_game_data ~year game =
     (* TODO: Get the preseason table, the parse into a string list list *)
     (* Then expand to get the regular, postseason, etc... tables *)
     (* TODO: Need to mark games as pre,post,regular season, etc... *)
+    (* TODO: Parse into a data_row *)
 
   let test () =
     let drew_brees = {
