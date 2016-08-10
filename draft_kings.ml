@@ -1,13 +1,5 @@
 (* Pull NFL historical data available *)
 
-#require "lwt.syntax";;
-#require "lwt";;
-#require "cohttp.lwt";;
-#require "uri";;
-#require "str";;
-#require "markup";;
-#require "csv";;
-
 open Lwt.Infix
 
 let (>>) = fun x y -> (x >>= fun _ -> y)
@@ -78,9 +70,9 @@ type player = {
 }
 
 type team = {
-  name : string;
-  city : string;
-  players : player list;
+  name       : string;
+  city       : string;
+  players    : player list;
   conference : string
 }
 
@@ -152,23 +144,23 @@ let string_of_game_type gt =
 
 let string_of_position p =
   match p with
-  | QB -> "QB"
-  | RB -> "RB"
-  | WR -> "WR"
-  | TE -> "TE"
-  | DST -> "DST"
+  | QB        -> "QB"
+  | RB        -> "RB"
+  | WR        -> "WR"
+  | TE        -> "TE"
+  | DST       -> "DST"
   | Unknown s -> "ERROR: " ^ s
 
 let string_of_status s =
   match s with
-  | Active -> "Active"
-  | InActive -> "Inactive"
+  | Active        -> "Active"
+  | InActive      -> "Inactive"
   | StatusError s -> "ERROR: " ^ s
 
 let game_result_of_string s =
-  let [a; b] = Str.split (Str.regexp "-") s in
-  let s1 = int_of_string a in
-  let s2 = int_of_string b in
+  let l = Str.split (Str.regexp "-") s in
+  let s1 = int_of_string (List.hd l) in
+  let s2 = int_of_string (List.nth l 1) in
   if s1 > s2
   then Win (s1, s2)
   else (
@@ -182,11 +174,11 @@ let string_of_game_result gr =
   | Win (a, b) | Loss (a, b) | Tie (a, b) -> (string_of_int a) ^ "-" ^ (string_of_int b)
 
 let game_date_of_string s =
-  let [year; month; day] = Str.split (Str.regexp "-") s in
+  let l = Str.split (Str.regexp "-") s in
   {
-    year = int_of_string year;
-    month = int_of_string month;
-    day = int_of_string day
+    year  = int_of_string @@ List.hd l;
+    month = int_of_string @@ List.nth l 1;
+    day   = int_of_string @@ List.nth l 2
   }
 
 let position_of_string s =
@@ -202,7 +194,7 @@ let status_of_string s =
   match String.lowercase s with
   | "active"   -> Active
   | "inactive" -> InActive
-  | _ as s -> StatusError s
+  | _ as s     -> StatusError s
 
 let team_name_of_string s =
   match s with
@@ -399,17 +391,6 @@ let player_html ?season player =
   in
   get_html player_url
 
-(* Get a list of player seasons from html *)
-let rec tokens_of_html ?(result = []) html =
-  let year =
-    Str.search_forward (Str.regexp "<option value=\"[0-9][0-9][0-9][0-9]>") html 0
-    |> fun n -> String.sub html (n+15) 4
-  in
-  let remaining_html =
-    tokens_of_html ~result:(year :: result)
-  in
-  ()
-
 (* Get all available seasons for a player *)
 let get_player_seasons html =
   let clean_string = Str.global_replace (Str.regexp "[\r\t\n ]") "" html in
@@ -580,10 +561,8 @@ let clean_game_data ~year game =
     ) (Array.of_list game)
   in
   (* Fix the Date into YYYY-MM-DD format *)
-  let [month; day] =
-      if arr.(1) = "Bye" then ["0"; "0"] else Str.split (Str.regexp "/") arr.(1)
-  in
-  arr.(1) <- ((string_of_int year) ^ "-" ^ month ^ "-" ^ day);
+  let l = if arr.(1) = "Bye" then ["0"; "0"] else Str.split (Str.regexp "/") arr.(1) in
+  arr.(1) <- ((string_of_int year) ^ "-" ^ (List.hd l) ^ "-" ^ (List.nth l 1));
   (* Fixup the opponet *)
   arr.(2) <- Str.global_replace (Str.regexp "[ @]+") "" arr.(2);
   (* Remove spaces from the score *)
@@ -650,6 +629,7 @@ let stats_in_season ?(write_headers = false) ~year player =
 
 (* Fetch & write the historical data for a player *)
 let save_player_data ~oc player =
+  Lwt_io.print (player.first_name ^ " "  ^ player.last_name ^ "\n") >>
   lwt html = player_html player in
   lwt years = get_player_seasons html in
   lwt player_data =
@@ -661,47 +641,49 @@ let save_player_data ~oc player =
   let player_and_data = List.map (fun x -> plr_str ^ "," ^ x) player_data in
   Lwt_list.iter_s (Lwt_io.write_line oc) player_and_data
 
+let write_headers oc =
+  Lwt_io.write_line oc
+    (
+      "FirstName,LastName,Height,Weight,Team,Status,Salary,Position,Rookie,ID," ^
+      "GameType,Week,GameDate,Opponet,GameResult,PlayedInGame,Starter," ^
+      "PassingComp,PassingAtt,PassingPct,PassingYds,PassingAvg,PassingTD," ^
+      "PassingInt,PassingSck,PassingScky,PassingRate,RushingAtt,RushingYds," ^
+      "RushingAvg,RushingTD,Fumbles,FumblesLost"
+    )
+
 let main () =
+  let open Lwt_unix in
   lwt oc =
     Lwt_io.open_file
-      ~flags:[Lwt_unix.O_CREAT; Lwt_unix.O_WRONLY]
+      ~flags:[O_WRONLY; O_CREAT; O_TRUNC]
       ~mode:Lwt_io.output
       "all_player_data.csv"
   in
   try_lwt
-    players_from_csv ()
-  >>= Lwt_list.iter_s (save_player_data ~oc)
-  >>= fun () -> Lwt_io.close oc
+    write_headers oc >>
+    lwt players = players_from_csv () in
+    Lwt_list.iter_s (save_player_data ~oc) players
+    >>= fun () -> Lwt_io.close oc
   with
-  _ -> Lwt_io.close oc
+    exn as e -> Lwt_io.close oc >> raise e
 
-
-let test () =
-  let drew_brees = {
-    first_name = "Drew";
-    last_name = "Brees";
-    height = 0;
-    weight = 0;
-    team = Saints;
-    status = Active;
-    salary = 0;
-    position = QB;
-    rookie = false;
-    id = 2504775
-  }
-  in
-  player_html ~season:(2009) drew_brees
-  >>= fun y -> stats_in_season ~year:2009 drew_brees
+module Test = struct
 
 let test_player = {
-  first_name = "Matt";
-  last_name = "Barkley";
-  height = 74;
-  weight = 227;
-  team = Cardinals;
+  first_name = "Trent";
+  last_name = "Williams";
+  height = 0;
+  weight = 0;
+  team = Redskins;
   status = Active;
   salary = 0;
-  position = Unknown "B";
+  position = Unknown "T";
   rookie = false;
-  id = 2539308
+  id = 497073
 }
+
+let test () =
+  player_html ~season:(2009) test_player
+  >>= fun y -> stats_in_season ~year:2009 test_player
+
+end
