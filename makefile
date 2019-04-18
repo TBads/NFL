@@ -8,13 +8,13 @@ all: compile_and_link clear_intermediate_files
 compile_and_link:
 > ocamlfind ocamlopt -thread -syntax camlp4o \
 > -package lwt,lwt.syntax,lwt.unix,cohttp.lwt,uri,str,markup \
-> -linkpkg -o PullPlayerData draft_kings.ml main.ml
+> -linkpkg -o PullPlayerData types.ml draft_kings.ml main.ml
 
 # Make a bytecode executable
 compile_and_link_byte:
 > ocamlfind ocamlc -custom -thread -syntax camlp4o \
 > -package lwt,lwt.syntax,lwt.unix,cohttp.lwt,uri,str,markup \
-> -linkpkg -o PullPlayerData draft_kings.ml main.ml
+> -linkpkg -o PullPlayerData types.ml draft_kings.ml main.ml
 
 clear_intermediate_files:
 > rm *.cmi *.cmx *.o
